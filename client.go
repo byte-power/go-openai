@@ -84,48 +84,6 @@ func withBody(body any) requestOption {
 	}
 }
 
-func withExtraBody(extraBody map[string]any) requestOption {
-	return func(args *requestOptions) {
-		if len(extraBody) == 0 {
-			return // No extra body to merge
-		}
-
-		// Check if args.body is already a map[string]any
-		if bodyMap, ok := args.body.(map[string]any); ok {
-			// If it's already a map[string]any, directly add extraBody fields
-			for key, value := range extraBody {
-				bodyMap[key] = value
-			}
-			return
-		}
-
-		// If args.body is a struct, convert it to map[string]any first
-		if args.body != nil {
-			var err error
-			var jsonBytes []byte
-			// Marshal the struct to JSON bytes
-			jsonBytes, err = json.Marshal(args.body)
-			if err != nil {
-				return // If marshaling fails, skip merging ExtraBody
-			}
-
-			// Unmarshal JSON bytes to map[string]any
-			var bodyMap map[string]any
-			if err = json.Unmarshal(jsonBytes, &bodyMap); err != nil {
-				return // If unmarshaling fails, skip merging ExtraBody
-			}
-
-			// Merge ExtraBody fields into the map
-			for key, value := range extraBody {
-				bodyMap[key] = value
-			}
-
-			// Replace args.body with the merged map
-			args.body = bodyMap
-		}
-	}
-}
-
 func withContentType(contentType string) requestOption {
 	return func(args *requestOptions) {
 		args.header.Set("Content-Type", contentType)
