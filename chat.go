@@ -280,8 +280,6 @@ type ChatCompletionRequest struct {
 	// Such as think mode for qwen3. "chat_template_kwargs": {"enable_thinking": false}
 	// https://qwen.readthedocs.io/en/latest/deployment/vllm.html#thinking-non-thinking-modes
 	ChatTemplateKwargs map[string]any `json:"chat_template_kwargs,omitempty"`
-	// Add additional JSON properties to the request
-	ExtraBody map[string]any `json:"extra_body,omitempty"`
 }
 
 type StreamOptions struct {
@@ -427,7 +425,6 @@ func (c *Client) CreateChatCompletion(
 		http.MethodPost,
 		c.fullURL(urlSuffix, withModel(request.Model)),
 		withBody(request),
-		withExtraBody(request.ExtraBody),
 	)
 	if err != nil {
 		return
