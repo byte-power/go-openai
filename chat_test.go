@@ -916,6 +916,429 @@ func getChatCompletionBody(r *http.Request) (openai.ChatCompletionRequest, error
 	return completion, nil
 }
 
+// Helper functions for TestChatCompletionRequestExtraBody to reduce complexity and improve maintainability
+
+func createBaseChatRequest() openai.ChatCompletionRequest {
+	return openai.ChatCompletionRequest{
+		Model: "gpt-4",
+		Messages: []openai.ChatCompletionMessage{
+			{
+				Role:    openai.ChatMessageRoleUser,
+				Content: "Hello!",
+			},
+		},
+	}
+}
+
+func verifyJSONContainsFields(t *testing.T, jsonStr string, expectedFields map[string]string) {
+	t.Helper()
+	for _, expected := range expectedFields {
+		if !strings.Contains(jsonStr, expected) {
+			t.Errorf("Expected JSON to contain %s, got: %s", expected, jsonStr)
+		}
+	}
+}
+
+func verifyExtraBodyExists(t *testing.T, extraBody map[string]any) {
+	t.Helper()
+	if extraBody == nil {
+		t.Fatal("ExtraBody should not be nil after unmarshaling")
+	}
+}
+
+func verifyStringField(t *testing.T, extraBody map[string]any, fieldName, expected string) {
+	t.Helper()
+	value, exists := extraBody[fieldName]
+	if !exists {
+		t.Errorf("%s should exist in ExtraBody", fieldName)
+		return
+	}
+	if value != expected {
+		t.Errorf("Expected %s to be '%s', got %v", fieldName, expected, value)
+	}
+}
+
+func verifyFloatField(t *testing.T, extraBody map[string]any, fieldName string, expected float64) {
+	t.Helper()
+	value, exists := extraBody[fieldName]
+	if !exists {
+		t.Errorf("%s should exist in ExtraBody", fieldName)
+		return
+	}
+	floatValue, ok := value.(float64)
+	if !ok {
+		t.Errorf("Expected %s to be float64, got type %T", fieldName, value)
+		return
+	}
+	if floatValue != expected {
+		t.Errorf("Expected %s to be %v, got %v", fieldName, expected, floatValue)
+	}
+}
+
+func verifyIntField(t *testing.T, extraBody map[string]any, fieldName string, expected int) {
+	t.Helper()
+	value, exists := extraBody[fieldName]
+	if !exists {
+		t.Errorf("%s should exist in ExtraBody", fieldName)
+		return
+	}
+	floatValue, ok := value.(float64)
+	if !ok {
+		t.Errorf("Expected %s to be float64, got type %T", fieldName, value)
+		return
+	}
+	if int(floatValue) != expected {
+		t.Errorf("Expected %s to be %d, got %v", fieldName, expected, int(floatValue))
+	}
+}
+
+func verifyBoolField(t *testing.T, extraBody map[string]any, fieldName string, expected bool) {
+	t.Helper()
+	value, exists := extraBody[fieldName]
+	if !exists {
+		t.Errorf("%s should exist in ExtraBody", fieldName)
+		return
+	}
+	boolValue, ok := value.(bool)
+	if !ok {
+		t.Errorf("Expected %s to be bool, got type %T", fieldName, value)
+		return
+	}
+	if boolValue != expected {
+		t.Errorf("Expected %s to be %v, got %v", fieldName, expected, boolValue)
+	}
+}
+
+func verifyArrayField(t *testing.T, extraBody map[string]any, fieldName string, expected []interface{}) {
+	t.Helper()
+	value, exists := extraBody[fieldName]
+	if !exists {
+		t.Errorf("%s should exist in ExtraBody", fieldName)
+		return
+	}
+	arrayValue, ok := value.([]interface{})
+	if !ok {
+		t.Errorf("Expected %s to be []interface{}, got type %T", fieldName, value)
+		return
+	}
+	if len(arrayValue) != len(expected) {
+		t.Errorf("Expected %s to have %d elements, got %d", fieldName, len(expected), len(arrayValue))
+		return
+	}
+	for i, expectedVal := range expected {
+		if arrayValue[i] != expectedVal {
+			t.Errorf("%s[%d]: expected %v, got %v", fieldName, i, expectedVal, arrayValue[i])
+		}
+	}
+}
+
+func verifyNestedObject(t *testing.T, extraBody map[string]any, fieldName, nestedKey, expectedValue string) {
+	t.Helper()
+	value, exists := extraBody[fieldName]
+	if !exists {
+		t.Errorf("%s should exist in ExtraBody", fieldName)
+		return
+	}
+	objectValue, ok := value.(map[string]interface{})
+	if !ok {
+		t.Errorf("Expected %s to be map[string]interface{}, got type %T", fieldName, value)
+		return
+	}
+	nestedValue, nestedExists := objectValue[nestedKey]
+	if !nestedExists {
+		t.Errorf("%s should exist in %s", nestedKey, fieldName)
+		return
+	}
+	if nestedValue != expectedValue {
+		t.Errorf("Expected %s.%s to be '%s', got %v", fieldName, nestedKey, expectedValue, nestedValue)
+	}
+}
+
+func verifyDeepNesting(t *testing.T, extraBody map[string]any) {
+	t.Helper()
+	deepNesting, ok := extraBody["deep_nesting"].(map[string]interface{})
+	if !ok {
+		t.Error("deep_nesting should be map[string]interface{}")
+		return
+	}
+	level1, ok := deepNesting["level1"].(map[string]interface{})
+	if !ok {
+		t.Error("level1 should be map[string]interface{}")
+		return
+	}
+	level2, ok := level1["level2"].(map[string]interface{})
+	if !ok {
+		t.Error("level2 should be map[string]interface{}")
+		return
+	}
+	value, ok := level2["value"].(string)
+	if !ok {
+		t.Error("deep nested value should be string")
+		return
+	}
+	if value != "deep_value" {
+		t.Errorf("Expected deep nested value to be 'deep_value', got %v", value)
+	}
+}
+
+func testExtraBodySerialization(t *testing.T) {
+	t.Helper()
+	req := createBaseChatRequest()
+	req.ExtraBody = map[string]any{
+		"custom_param":  "custom_value",
+		"numeric_param": 42,
+		"boolean_param": true,
+		"array_param":   []string{"item1", "item2"},
+		"object_param": map[string]any{
+			"nested_key": "nested_value",
+		},
+	}
+
+	data, err := json.Marshal(req)
+	checks.NoError(t, err, "Failed to marshal request with ExtraBody")
+
+	// Verify JSON serialization
+	expectedFields := map[string]string{
+		"extra_body":    `"extra_body"`,
+		"custom_param":  `"custom_param":"custom_value"`,
+		"numeric_param": `"numeric_param":42`,
+		"boolean_param": `"boolean_param":true`,
+	}
+	verifyJSONContainsFields(t, string(data), expectedFields)
+
+	// Verify deserialization
+	var unmarshaled openai.ChatCompletionRequest
+	err = json.Unmarshal(data, &unmarshaled)
+	checks.NoError(t, err, "Failed to unmarshal request with ExtraBody")
+
+	verifyExtraBodyExists(t, unmarshaled.ExtraBody)
+	verifyStringField(t, unmarshaled.ExtraBody, "custom_param", "custom_value")
+	verifyIntField(t, unmarshaled.ExtraBody, "numeric_param", 42)
+	verifyBoolField(t, unmarshaled.ExtraBody, "boolean_param", true)
+	verifyArrayField(t, unmarshaled.ExtraBody, "array_param", []interface{}{"item1", "item2"})
+	verifyNestedObject(t, unmarshaled.ExtraBody, "object_param", "nested_key", "nested_value")
+}
+
+func testEmptyExtraBody(t *testing.T) {
+	t.Helper()
+	req := createBaseChatRequest()
+	req.ExtraBody = map[string]any{}
+
+	data, err := json.Marshal(req)
+	checks.NoError(t, err, "Failed to marshal request with empty ExtraBody")
+
+	if strings.Contains(string(data), `"extra_body"`) {
+		t.Error("Empty ExtraBody should be omitted from JSON")
+	}
+
+	var unmarshaled openai.ChatCompletionRequest
+	err = json.Unmarshal(data, &unmarshaled)
+	checks.NoError(t, err, "Failed to unmarshal request with empty ExtraBody")
+
+	if unmarshaled.ExtraBody != nil {
+		t.Error("ExtraBody should be nil when empty ExtraBody is omitted from JSON")
+	}
+}
+
+func testNilExtraBody(t *testing.T) {
+	t.Helper()
+	req := createBaseChatRequest()
+	req.ExtraBody = nil
+
+	data, err := json.Marshal(req)
+	checks.NoError(t, err, "Failed to marshal request with nil ExtraBody")
+
+	if strings.Contains(string(data), `"extra_body"`) {
+		t.Error("Nil ExtraBody should be omitted from JSON")
+	}
+
+	var unmarshaled openai.ChatCompletionRequest
+	err = json.Unmarshal(data, &unmarshaled)
+	checks.NoError(t, err, "Failed to unmarshal request with nil ExtraBody")
+
+	if unmarshaled.ExtraBody != nil {
+		t.Error("ExtraBody should remain nil when not present in JSON")
+	}
+}
+
+func testComplexDataTypes(t *testing.T) {
+	t.Helper()
+	req := createBaseChatRequest()
+	req.ExtraBody = map[string]any{
+		"float_param":   3.14159,
+		"negative_int":  -42,
+		"zero_value":    0,
+		"empty_string":  "",
+		"unicode_text":  "你好世界",
+		"special_chars": "!@#$%^&*()",
+		"nested_arrays": []any{[]string{"a", "b"}, []int{1, 2, 3}},
+		"mixed_array":   []any{"string", 42, true, nil},
+		"deep_nesting": map[string]any{
+			"level1": map[string]any{
+				"level2": map[string]any{
+					"value": "deep_value",
+				},
+			},
+		},
+	}
+
+	data, err := json.Marshal(req)
+	checks.NoError(t, err, "Failed to marshal request with complex ExtraBody")
+
+	var unmarshaled openai.ChatCompletionRequest
+	err = json.Unmarshal(data, &unmarshaled)
+	checks.NoError(t, err, "Failed to unmarshal request with complex ExtraBody")
+
+	verifyExtraBodyExists(t, unmarshaled.ExtraBody)
+	verifyFloatField(t, unmarshaled.ExtraBody, "float_param", 3.14159)
+	verifyIntField(t, unmarshaled.ExtraBody, "negative_int", -42)
+	verifyStringField(t, unmarshaled.ExtraBody, "unicode_text", "你好世界")
+	verifyArrayField(t, unmarshaled.ExtraBody, "mixed_array", []interface{}{"string", float64(42), true, nil})
+	verifyDeepNesting(t, unmarshaled.ExtraBody)
+}
+
+func testInvalidJSONHandling(t *testing.T) {
+	t.Helper()
+	invalidJSON := `{"model":"gpt-4","extra_body":{"invalid_json":}}`
+	var req openai.ChatCompletionRequest
+	err := json.Unmarshal([]byte(invalidJSON), &req)
+	if err == nil {
+		t.Error("Expected error when unmarshaling invalid JSON, but got nil")
+	}
+}
+
+func testExtraBodyFieldConflicts(t *testing.T) {
+	t.Helper()
+	req := createBaseChatRequest()
+	req.MaxTokens = 100
+	req.ExtraBody = map[string]any{
+		"model":        "should-not-override",
+		"max_tokens":   9999,
+		"custom_field": "custom_value",
+	}
+
+	data, err := json.Marshal(req)
+	checks.NoError(t, err, "Failed to marshal request with field conflicts in ExtraBody")
+
+	var jsonMap map[string]any
+	err = json.Unmarshal(data, &jsonMap)
+	checks.NoError(t, err, "Failed to unmarshal JSON to generic map")
+
+	if jsonMap["model"] != "gpt-4" {
+		t.Errorf("Standard model field should be 'gpt-4', got %v", jsonMap["model"])
+	}
+
+	maxTokens, ok := jsonMap["max_tokens"].(float64)
+	if !ok || int(maxTokens) != 100 {
+		t.Errorf("Standard max_tokens field should be 100, got %v", jsonMap["max_tokens"])
+	}
+
+	extraBody, ok := jsonMap["extra_body"].(map[string]interface{})
+	if !ok {
+		t.Error("ExtraBody should be present in JSON")
+		return
+	}
+	customField, ok := extraBody["custom_field"].(string)
+	if !ok || customField != "custom_value" {
+		t.Errorf("Expected custom_field to be 'custom_value', got %v", customField)
+	}
+}
+
+func TestChatCompletionRequestExtraBody(t *testing.T) {
+	t.Run("ExtraBodySerialization", testExtraBodySerialization)
+	t.Run("EmptyExtraBody", testEmptyExtraBody)
+	t.Run("NilExtraBody", testNilExtraBody)
+	t.Run("ComplexDataTypes", testComplexDataTypes)
+	t.Run("InvalidJSONHandling", testInvalidJSONHandling)
+	t.Run("ExtraBodyFieldConflicts", testExtraBodyFieldConflicts)
+}
+
+func TestChatCompletionWithExtraBody(t *testing.T) {
+	client, server, teardown := setupOpenAITestServer()
+	defer teardown()
+
+	// Set up a handler that verifies ExtraBody fields are merged into the request body
+	server.RegisterHandler("/v1/chat/completions", func(w http.ResponseWriter, r *http.Request) {
+		var reqBody map[string]any
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, "Failed to read request body", http.StatusInternalServerError)
+			return
+		}
+
+		err = json.Unmarshal(body, &reqBody)
+		if err != nil {
+			http.Error(w, "Failed to parse request body", http.StatusInternalServerError)
+			return
+		}
+
+		// Verify that ExtraBody fields are merged at the top level
+		if reqBody["custom_parameter"] != "test_value" {
+			http.Error(w, "ExtraBody custom_parameter not found in request", http.StatusBadRequest)
+			return
+		}
+		if reqBody["additional_config"] != true {
+			http.Error(w, "ExtraBody additional_config not found in request", http.StatusBadRequest)
+			return
+		}
+
+		// Verify standard fields are still present
+		if reqBody["model"] != "gpt-4" {
+			http.Error(w, "Standard model field not found", http.StatusBadRequest)
+			return
+		}
+
+		// Return a mock response
+		res := openai.ChatCompletionResponse{
+			ID:      "test-id",
+			Object:  "chat.completion",
+			Created: time.Now().Unix(),
+			Model:   "gpt-4",
+			Choices: []openai.ChatCompletionChoice{
+				{
+					Index: 0,
+					Message: openai.ChatCompletionMessage{
+						Role:    openai.ChatMessageRoleAssistant,
+						Content: "Hello! I received your message with extra parameters.",
+					},
+					FinishReason: openai.FinishReasonStop,
+				},
+			},
+			Usage: openai.Usage{
+				PromptTokens:     10,
+				CompletionTokens: 20,
+				TotalTokens:      30,
+			},
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		err = json.NewEncoder(w).Encode(res)
+		if err != nil {
+			http.Error(w, "Failed to encode response", http.StatusInternalServerError)
+			return
+		}
+	})
+
+	// Test ChatCompletion with ExtraBody
+	_, err := client.CreateChatCompletion(context.Background(), openai.ChatCompletionRequest{
+		Model: "gpt-4",
+		Messages: []openai.ChatCompletionMessage{
+			{
+				Role:    openai.ChatMessageRoleUser,
+				Content: "Hello!",
+			},
+		},
+		ExtraBody: map[string]any{
+			"custom_parameter":  "test_value",
+			"additional_config": true,
+			"numeric_setting":   123,
+			"array_setting":     []string{"option1", "option2"},
+		},
+	})
+
+	checks.NoError(t, err, "CreateChatCompletion with ExtraBody should not fail")
+}
+
 func TestFinishReason(t *testing.T) {
 	c := &openai.ChatCompletionChoice{
 		FinishReason: openai.FinishReasonNull,

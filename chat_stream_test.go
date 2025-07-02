@@ -1021,3 +1021,486 @@ func compareChatStreamResponseChoices(c1, c2 openai.ChatCompletionStreamChoice) 
 	}
 	return true
 }
+
+// Helper functions for TestCreateChatCompletionStreamExtraBody to reduce complexity and improve maintainability
+
+func deepEqual(a, b interface{}) bool {
+	if a == nil && b == nil {
+		return true
+	}
+	if a == nil || b == nil {
+		return false
+	}
+
+	// Use reflection for deep comparison to handle maps, slices, etc.
+	aJSON, aErr := json.Marshal(a)
+	bJSON, bErr := json.Marshal(b)
+	if aErr != nil || bErr != nil {
+		return false
+	}
+	return string(aJSON) == string(bJSON)
+}
+
+func createBaseChatStreamRequest() openai.ChatCompletionRequest {
+	return openai.ChatCompletionRequest{
+		Model: "gpt-4",
+		Messages: []openai.ChatCompletionMessage{
+			{
+				Role:    openai.ChatMessageRoleUser,
+				Content: "Hello!",
+			},
+		},
+		Stream: true,
+	}
+}
+
+func validateExtraBodyFields(reqBody map[string]any, expectedExtraFields map[string]any) error {
+	for key, expectedValue := range expectedExtraFields {
+		actualValue, exists := reqBody[key]
+		if !exists {
+			return fmt.Errorf("ExtraBody field %s not found in request", key)
+		}
+
+		// Handle complex types comparison safely
+		if !deepEqual(actualValue, expectedValue) {
+			return fmt.Errorf("ExtraBody field %s value mismatch: expected %v, got %v",
+				key, expectedValue, actualValue)
+		}
+	}
+	return nil
+}
+
+func validateStandardFields(reqBody map[string]any) error {
+	if reqBody["model"] != "gpt-4" {
+		return fmt.Errorf("standard model field not found")
+	}
+
+	if reqBody["stream"] != true {
+		return fmt.Errorf("stream field should be true")
+	}
+	return nil
+}
+
+func parseRequestBody(r *http.Request) (map[string]any, error) {
+	var reqBody map[string]any
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read request body: %w", err)
+	}
+
+	err = json.Unmarshal(body, &reqBody)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse request body: %w", err)
+	}
+	return reqBody, nil
+}
+
+func writeStreamingResponse(t *testing.T, w http.ResponseWriter) {
+	t.Helper()
+	w.Header().Set("Content-Type", "text/event-stream")
+
+	responses := []string{
+		`{"id":"test-1","object":"chat.completion.chunk","created":1598069254,` +
+			`"model":"gpt-4","system_fingerprint":"fp_test",` +
+			`"choices":[{"index":0,"delta":{"content":"Hello"},"finish_reason":null}]}`,
+		`{"id":"test-2","object":"chat.completion.chunk","created":1598069255,` +
+			`"model":"gpt-4","system_fingerprint":"fp_test",` +
+			`"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`,
+	}
+
+	dataBytes := []byte{}
+	for _, response := range responses {
+		dataBytes = append(dataBytes, []byte("event: message\n")...)
+		dataBytes = append(dataBytes, []byte("data: "+response+"\n\n")...)
+	}
+
+	dataBytes = append(dataBytes, []byte("event: done\n")...)
+	dataBytes = append(dataBytes, []byte("data: [DONE]\n\n")...)
+
+	_, err := w.Write(dataBytes)
+	if err != nil {
+		t.Errorf("Failed to write response: %v", err)
+	}
+}
+
+func createStreamHandler(t *testing.T, expectedExtraFields map[string]any) func(
+	w http.ResponseWriter, r *http.Request) {
+	t.Helper()
+	return func(w http.ResponseWriter, r *http.Request) {
+		if expectedExtraFields == nil {
+			writeStreamingResponse(t, w)
+			return
+		}
+
+		reqBody, err := parseRequestBody(r)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		if validationErr := validateExtraBodyFields(reqBody, expectedExtraFields); validationErr != nil {
+			http.Error(w, validationErr.Error(), http.StatusBadRequest)
+			return
+		}
+
+		if standardErr := validateStandardFields(reqBody); standardErr != nil {
+			http.Error(w, standardErr.Error(), http.StatusBadRequest)
+			return
+		}
+
+		writeStreamingResponse(t, w)
+	}
+}
+
+func verifyStreamResponse(t *testing.T, stream *openai.ChatCompletionStream,
+	expectedResponses []openai.ChatCompletionStreamResponse) {
+	t.Helper()
+
+	if stream == nil {
+		t.Fatal("Stream is nil - cannot verify response")
+		return
+	}
+
+	defer stream.Close()
+
+	for ix, expectedResponse := range expectedResponses {
+		receivedResponse, streamErr := stream.Recv()
+		checks.NoError(t, streamErr, "stream.Recv() failed")
+		if !compareChatResponses(expectedResponse, receivedResponse) {
+			t.Errorf("Stream response %v is %v, expected %v", ix, receivedResponse, expectedResponse)
+		}
+	}
+
+	_, streamErr := stream.Recv()
+	if !errors.Is(streamErr, io.EOF) {
+		t.Errorf("stream.Recv() did not return EOF in the end: %v", streamErr)
+	}
+}
+
+func testStreamExtraBodyWithParameters(t *testing.T) {
+	t.Helper()
+	client, server, teardown := setupOpenAITestServer()
+	defer teardown()
+
+	expectedExtraFields := map[string]any{
+		"custom_parameter":  "test_value",
+		"additional_config": true,
+		"numeric_setting":   float64(123), // JSON unmarshaling converts numbers to float64
+		"temperature":       float64(0.7),
+	}
+
+	server.RegisterHandler("/v1/chat/completions", createStreamHandler(t, expectedExtraFields))
+
+	req := createBaseChatStreamRequest()
+	req.ExtraBody = map[string]any{
+		"custom_parameter":  "test_value",
+		"additional_config": true,
+		"numeric_setting":   123,
+		"temperature":       0.7,
+	}
+
+	stream, err := client.CreateChatCompletionStream(context.Background(), req)
+	checks.NoError(t, err, "CreateChatCompletionStream with ExtraBody should not fail")
+
+	expectedResponses := []openai.ChatCompletionStreamResponse{
+		{
+			ID:                "test-1",
+			Object:            "chat.completion.chunk",
+			Created:           1598069254,
+			Model:             "gpt-4",
+			SystemFingerprint: "fp_test",
+			Choices: []openai.ChatCompletionStreamChoice{
+				{
+					Index: 0,
+					Delta: openai.ChatCompletionStreamChoiceDelta{
+						Content: "Hello",
+					},
+				},
+			},
+		},
+		{
+			ID:                "test-2",
+			Object:            "chat.completion.chunk",
+			Created:           1598069255,
+			Model:             "gpt-4",
+			SystemFingerprint: "fp_test",
+			Choices: []openai.ChatCompletionStreamChoice{
+				{
+					Index:        0,
+					Delta:        openai.ChatCompletionStreamChoiceDelta{},
+					FinishReason: "stop",
+				},
+			},
+		},
+	}
+
+	verifyStreamResponse(t, stream, expectedResponses)
+}
+
+func testStreamExtraBodyComplexData(t *testing.T) {
+	t.Helper()
+	client, server, teardown := setupOpenAITestServer()
+	defer teardown()
+
+	expectedExtraFields := map[string]any{
+		"array_param":   []interface{}{"item1", "item2"},
+		"unicode_text":  "你好世界",
+		"special_chars": "!@#$%^&*()",
+		"nested_config": map[string]interface{}{"enabled": true, "level": float64(5)},
+		"mixed_array":   []interface{}{"string", float64(42), true, nil},
+		"float_param":   3.14159,
+		"negative_int":  float64(-42),
+		"zero_value":    float64(0),
+	}
+
+	server.RegisterHandler("/v1/chat/completions", createStreamHandler(t, expectedExtraFields))
+
+	req := createBaseChatStreamRequest()
+	req.ExtraBody = map[string]any{
+		"array_param":   []string{"item1", "item2"},
+		"unicode_text":  "你好世界",
+		"special_chars": "!@#$%^&*()",
+		"nested_config": map[string]any{
+			"enabled": true,
+			"level":   5,
+		},
+		"mixed_array":  []any{"string", 42, true, nil},
+		"float_param":  3.14159,
+		"negative_int": -42,
+		"zero_value":   0,
+	}
+
+	stream, err := client.CreateChatCompletionStream(context.Background(), req)
+	checks.NoError(t, err, "CreateChatCompletionStream with complex ExtraBody should not fail")
+
+	expectedResponses := []openai.ChatCompletionStreamResponse{
+		{
+			ID:                "test-1",
+			Object:            "chat.completion.chunk",
+			Created:           1598069254,
+			Model:             "gpt-4",
+			SystemFingerprint: "fp_test",
+			Choices: []openai.ChatCompletionStreamChoice{
+				{
+					Index: 0,
+					Delta: openai.ChatCompletionStreamChoiceDelta{
+						Content: "Hello",
+					},
+				},
+			},
+		},
+		{
+			ID:                "test-2",
+			Object:            "chat.completion.chunk",
+			Created:           1598069255,
+			Model:             "gpt-4",
+			SystemFingerprint: "fp_test",
+			Choices: []openai.ChatCompletionStreamChoice{
+				{
+					Index:        0,
+					Delta:        openai.ChatCompletionStreamChoiceDelta{},
+					FinishReason: "stop",
+				},
+			},
+		},
+	}
+
+	verifyStreamResponse(t, stream, expectedResponses)
+}
+
+func testStreamExtraBodyEmpty(t *testing.T) {
+	t.Helper()
+	client, server, teardown := setupOpenAITestServer()
+	defer teardown()
+
+	server.RegisterHandler("/v1/chat/completions", createStreamHandler(t, nil))
+
+	req := createBaseChatStreamRequest()
+	req.ExtraBody = map[string]any{}
+
+	stream, err := client.CreateChatCompletionStream(context.Background(), req)
+	checks.NoError(t, err, "CreateChatCompletionStream with empty ExtraBody should not fail")
+
+	expectedResponses := []openai.ChatCompletionStreamResponse{
+		{
+			ID:                "test-1",
+			Object:            "chat.completion.chunk",
+			Created:           1598069254,
+			Model:             "gpt-4",
+			SystemFingerprint: "fp_test",
+			Choices: []openai.ChatCompletionStreamChoice{
+				{
+					Index: 0,
+					Delta: openai.ChatCompletionStreamChoiceDelta{
+						Content: "Hello",
+					},
+				},
+			},
+		},
+		{
+			ID:                "test-2",
+			Object:            "chat.completion.chunk",
+			Created:           1598069255,
+			Model:             "gpt-4",
+			SystemFingerprint: "fp_test",
+			Choices: []openai.ChatCompletionStreamChoice{
+				{
+					Index:        0,
+					Delta:        openai.ChatCompletionStreamChoiceDelta{},
+					FinishReason: "stop",
+				},
+			},
+		},
+	}
+
+	verifyStreamResponse(t, stream, expectedResponses)
+}
+
+func testStreamExtraBodyNil(t *testing.T) {
+	t.Helper()
+	client, server, teardown := setupOpenAITestServer()
+	defer teardown()
+
+	server.RegisterHandler("/v1/chat/completions", createStreamHandler(t, nil))
+
+	req := createBaseChatStreamRequest()
+	req.ExtraBody = nil
+
+	stream, err := client.CreateChatCompletionStream(context.Background(), req)
+	checks.NoError(t, err, "CreateChatCompletionStream with nil ExtraBody should not fail")
+
+	expectedResponses := []openai.ChatCompletionStreamResponse{
+		{
+			ID:                "test-1",
+			Object:            "chat.completion.chunk",
+			Created:           1598069254,
+			Model:             "gpt-4",
+			SystemFingerprint: "fp_test",
+			Choices: []openai.ChatCompletionStreamChoice{
+				{
+					Index: 0,
+					Delta: openai.ChatCompletionStreamChoiceDelta{
+						Content: "Hello",
+					},
+				},
+			},
+		},
+		{
+			ID:                "test-2",
+			Object:            "chat.completion.chunk",
+			Created:           1598069255,
+			Model:             "gpt-4",
+			SystemFingerprint: "fp_test",
+			Choices: []openai.ChatCompletionStreamChoice{
+				{
+					Index:        0,
+					Delta:        openai.ChatCompletionStreamChoiceDelta{},
+					FinishReason: "stop",
+				},
+			},
+		},
+	}
+
+	verifyStreamResponse(t, stream, expectedResponses)
+}
+
+func testStreamExtraBodyFieldConflicts(t *testing.T) {
+	t.Helper()
+	client, server, teardown := setupOpenAITestServer()
+	defer teardown()
+
+	// Handler that verifies ExtraBody fields override standard fields
+	server.RegisterHandler("/v1/chat/completions", func(w http.ResponseWriter, r *http.Request) {
+		var reqBody map[string]any
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, "Failed to read request body", http.StatusInternalServerError)
+			return
+		}
+
+		err = json.Unmarshal(body, &reqBody)
+		if err != nil {
+			http.Error(w, "Failed to parse request body", http.StatusInternalServerError)
+			return
+		}
+
+		// Verify ExtraBody fields override standard fields
+		if reqBody["model"] != "overridden-model" {
+			msg := fmt.Sprintf("Model field should be overridden to 'overridden-model', got %v",
+				reqBody["model"])
+			http.Error(w, msg, http.StatusBadRequest)
+			return
+		}
+
+		if reqBody["stream"] != true {
+			http.Error(w, fmt.Sprintf("Stream field should remain true, got %v", reqBody["stream"]), http.StatusBadRequest)
+			return
+		}
+
+		maxTokens, ok := reqBody["max_tokens"].(float64)
+		if !ok || int(maxTokens) != 9999 {
+			msg := fmt.Sprintf("MaxTokens field should be overridden to 9999, got %v",
+				reqBody["max_tokens"])
+			http.Error(w, msg, http.StatusBadRequest)
+			return
+		}
+
+		// Verify custom field from ExtraBody is present at top level
+		if reqBody["custom_field"] != "custom_value" {
+			msg := fmt.Sprintf("Custom field from ExtraBody should be 'custom_value', got %v",
+				reqBody["custom_field"])
+			http.Error(w, msg, http.StatusBadRequest)
+			return
+		}
+
+		// Send streaming response using the overridden model name
+		w.Header().Set("Content-Type", "text/event-stream")
+		data := `{"id":"test-1","object":"chat.completion.chunk","created":1598069254,` +
+			`"model":"overridden-model","system_fingerprint":"fp_test",` +
+			`"choices":[{"index":0,"delta":{"content":"Response"},"finish_reason":"stop"}]}`
+		_, writeErr := w.Write([]byte("data: " + data + "\n\ndata: [DONE]\n\n"))
+		if writeErr != nil {
+			t.Errorf("Failed to write response: %v", writeErr)
+		}
+	})
+
+	req := createBaseChatStreamRequest()
+	req.MaxTokens = 100
+	req.ExtraBody = map[string]any{
+		"model":        "overridden-model", // this should override the standard model field
+		"max_tokens":   9999,               // this should override the standard max_tokens field
+		"custom_field": "custom_value",     // this is a new field
+	}
+
+	stream, err := client.CreateChatCompletionStream(context.Background(), req)
+	checks.NoError(t, err, "CreateChatCompletionStream with field overrides should not fail")
+
+	expectedResponses := []openai.ChatCompletionStreamResponse{
+		{
+			ID:                "test-1",
+			Object:            "chat.completion.chunk",
+			Created:           1598069254,
+			Model:             "overridden-model",
+			SystemFingerprint: "fp_test",
+			Choices: []openai.ChatCompletionStreamChoice{
+				{
+					Index: 0,
+					Delta: openai.ChatCompletionStreamChoiceDelta{
+						Content: "Response",
+					},
+					FinishReason: "stop",
+				},
+			},
+		},
+	}
+
+	verifyStreamResponse(t, stream, expectedResponses)
+}
+
+func TestCreateChatCompletionStreamExtraBody(t *testing.T) {
+	t.Run("WithParameters", testStreamExtraBodyWithParameters)
+	t.Run("ComplexData", testStreamExtraBodyComplexData)
+	t.Run("EmptyExtraBody", testStreamExtraBodyEmpty)
+	t.Run("NilExtraBody", testStreamExtraBodyNil)
+	t.Run("FieldConflicts", testStreamExtraBodyFieldConflicts)
+}
